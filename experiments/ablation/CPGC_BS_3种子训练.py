@@ -1,0 +1,355 @@
+"""CPGC + Balanced Softmax 对照实验 (3 种子 x 2 配置)
+============================================================
+目的：验证"长尾先验校正"(Balanced Softmax) 能否叠加到 CPGC（正交增益）。
+改动：融合分类头的 CE 换成 Balanced Softmax（logits += log(prior)），
+      原型辅助损失保持 CE 不变；训练与推理同规则（BS 论文约定）。
+配置：no_sampler（BS 文献标准用法）/ with_sampler（与主结果协议对齐）。
+注意：主结果 CPGC 开 WeightedRandomSampler，叠加 BS 属双重校正，预期掉点；
+      no_sampler 版是 BS 最优配置。两个结果分别对论文叙事有价值。
+"""
+import os, sys, time, csv, random, math
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.cuda.amp import autocast, GradScaler
+from torch.utils.data import DataLoader, WeightedRandomSampler
+from torchvision import datasets, transforms
+from torchvision.models import resnet50
+
+SEEDS = [42, 123, 456]
+IMG_SIZE = 224
+DATA_DIR = "D:/EMA/GC10_dataset"
+OUTPUT_DIR = os.path.dirname(os.path.abspath(__file__))
+EPOCHS = 100
+BATCH_SIZE = 32
+# 两个配置：no_sampler（BS 文献标准用法）/ with_sampler（与主结果协议对齐）
+CONFIGS = [
+    {"use_sampler": False, "tag": "no_sampler"},
+    {"use_sampler": True,  "tag": "with_sampler"},
+]
+BALANCE_CLASSES = True
+LAMBDA_SC = 0.1     # SupCon loss 权重
+LAMBDA_PROTO = 0.3   # 原型分类 loss 权重
+TEMPERATURE = 0.07
+PROTO_TEMP = 0.1     # 原型余弦相似度的温度
+PROTO_EMA = 0.9      # 原型 EMA 衰减
+PROTO_START = 10     # 前 10 个 epoch 不做原型分类（特征不稳定）
+
+DINO_WEIGHTS_PATH = "D:/EMA/DINO预训练实验/dino_resnet50_pretrain.pth"
+DINO_WEIGHTS_URLS = [
+    "https://dl.fbaipublicfiles.com/dino/dino_resnet50_pretrain.pth",
+    "https://dl.fbaipublicfiles.com/dino/dino_resnet50_pretrain/dino_resnet50_pretrain.pth",
+]
+
+
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+# ===================== LOSS =====================
+def supcon_loss(features, labels, temperature=0.07):
+    N = labels.shape[0]
+    device = features.device
+    features = F.normalize(features, dim=1)
+    sim = features @ features.T / temperature
+    pos_mask = (labels.unsqueeze(0) == labels.unsqueeze(1)).float().to(device)
+    pos_mask.fill_diagonal_(0)
+    neg_mask = (labels.unsqueeze(0) != labels.unsqueeze(1)).float().to(device)
+    exp_sim = torch.exp(sim)
+    denom = (exp_sim * (pos_mask + neg_mask)).sum(dim=1, keepdim=True)
+    log_prob = sim - torch.log(denom + 1e-8)
+    pos_count = torch.clamp(pos_mask.sum(dim=1), min=1.0)
+    return -(pos_mask * log_prob).sum(dim=1).div(pos_count).mean()
+
+
+# ===================== DINO BACKBONE =====================
+def load_dino_backbone():
+    if not os.path.exists(DINO_WEIGHTS_PATH):
+        print("Downloading DINO weights...")
+        for url in DINO_WEIGHTS_URLS:
+            try:
+                torch.hub.download_url_to_file(url, DINO_WEIGHTS_PATH)
+                break
+            except Exception:
+                continue
+    checkpoint = torch.load(DINO_WEIGHTS_PATH, map_location="cpu")
+    if isinstance(checkpoint, dict) and 'teacher' in checkpoint:
+        state_dict = checkpoint['teacher']
+    elif isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
+        state_dict = checkpoint['state_dict']
+    else:
+        state_dict = checkpoint
+    model = resnet50()
+    model.fc = nn.Identity()
+    filtered = {k[7:] if k.startswith('module.') else k: v
+                for k, v in state_dict.items()
+                if not k.startswith('fc.')}
+    model.load_state_dict(filtered, strict=False)
+    print(f"Loaded DINO backbone ({len(filtered)} params)")
+    return model
+
+
+# ===================== CPGC 模型 =====================
+class CPGC(nn.Module):
+    def __init__(self, num_classes=10, proj_dim=128, class_prior=None):
+        super().__init__()
+        self.backbone = load_dino_backbone()
+        self.num_classes = num_classes
+        self.proj_dim = proj_dim
+
+        # 投影头 (SupCon)
+        self.projection = nn.Sequential(
+            nn.Linear(2048, 512),
+            nn.BatchNorm1d(512),
+            nn.ReLU(inplace=True),
+            nn.Linear(512, proj_dim),
+        )
+
+        # MLP 分类头
+        self.classifier = nn.Sequential(
+            nn.Linear(2048, 1024),
+            nn.ReLU(inplace=True),
+            nn.Linear(1024, 512),
+            nn.ReLU(inplace=True),
+            nn.Linear(512, num_classes),
+        )
+
+        # 类原型缓存 (不参与梯度)
+        self.register_buffer(
+            "prototypes",
+            torch.randn(num_classes, proj_dim) * 0.01  # (10, 128)
+        )
+        self.register_buffer(
+            "proto_count",
+            torch.zeros(num_classes)  # 每个类更新了多少次
+        )
+
+        # 融合参数 (可学习)
+        self.fusion_alpha = nn.Parameter(torch.tensor(0.5))
+
+        # 原型温度 (可学习)
+        self.log_proto_temp = nn.Parameter(torch.tensor(math.log(0.1)))
+
+        # Balanced Softmax 类别先验 log(pi)；class_prior=None 时不用 BS
+        if class_prior is not None:
+            self.register_buffer("log_prior", torch.log(class_prior))
+            self.use_bs = True
+        else:
+            self.log_prior = None
+            self.use_bs = False
+
+    def compute_proto_scores(self, proj_features):
+        """proj_features: (B, 128), 返回 (B, num_classes) 余弦相似度"""
+        proj_norm = F.normalize(proj_features, dim=1)
+        proto_norm = F.normalize(self.prototypes, dim=1)
+        sim = proj_norm @ proto_norm.T  # (B, num_classes)
+        temp = torch.exp(self.log_proto_temp).clamp(min=0.01)
+        return sim / temp  # 可学习温度
+
+    def update_prototypes(self, proj_features, labels):
+        """EMA 更新类原型"""
+        with torch.no_grad():
+            proj_norm = F.normalize(proj_features, dim=1)
+            for c in range(self.num_classes):
+                mask = labels == c
+                if mask.sum() == 0:
+                    continue
+                class_mean = proj_norm[mask].mean(dim=0)
+                if self.proto_count[c] == 0:
+                    self.prototypes[c] = class_mean
+                else:
+                    self.prototypes[c] = (
+                        PROTO_EMA * self.prototypes[c] +
+                        (1 - PROTO_EMA) * class_mean
+                    )
+                self.proto_count[c] += 1
+
+    def forward(self, x, labels=None, epoch=None):
+        feat = self.backbone(x)          # (B, 2048)
+        proj = self.projection(feat)     # (B, 128)
+        mlp_logits = self.classifier(feat)  # (B, 10)
+
+        # 原型分类
+        if epoch is not None and epoch >= PROTO_START:
+            proto_scores = self.compute_proto_scores(proj)
+            alpha = torch.sigmoid(self.fusion_alpha)
+            final_logits = alpha * mlp_logits + (1 - alpha) * proto_scores
+        else:
+            proto_scores = None
+            final_logits = mlp_logits
+
+        if self.use_bs:
+            final_logits = final_logits + self.log_prior
+
+        return proj, mlp_logits, proto_scores, final_logits
+
+
+# ===================== 训练 =====================
+def train_one(seed, train_loader, test_loader, num_classes, device, tag):
+    set_seed(seed)
+    model = CPGC(num_classes=num_classes, class_prior=CLASS_PRIOR).to(device)
+    criterion_ce = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(model.parameters(), lr=1e-3)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
+    scaler = GradScaler()
+
+    best_acc = 0.0
+    best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+
+    for epoch in range(1, EPOCHS + 1):
+        t0 = time.time()
+        model.train()
+        tr_ce, tr_sc, tr_proto, tr_correct, tr_total = 0.0, 0.0, 0.0, 0, 0
+
+        for images, labels in train_loader:
+            images, labels = images.to(device), labels.to(device)
+            bsz = labels.size(0)
+
+            optimizer.zero_grad()
+            with autocast():
+                proj, mlp_logits, proto_scores, final_logits = model(
+                    images, labels=labels, epoch=epoch
+                )
+
+                loss_ce = criterion_ce(final_logits, labels)
+                loss_sc = supcon_loss(proj, labels, TEMPERATURE)
+                loss = loss_ce + LAMBDA_SC * loss_sc
+
+                if proto_scores is not None:
+                    loss_proto = criterion_ce(proto_scores, labels)
+                    loss = loss + LAMBDA_PROTO * loss_proto
+                    tr_proto += loss_proto.item() * bsz
+
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+
+            # 更新原型
+            if epoch >= PROTO_START:
+                model.update_prototypes(proj.detach(), labels)
+
+            tr_ce += loss_ce.item() * bsz
+            tr_sc += loss_sc.item() * bsz
+            _, predicted = final_logits.max(1)
+            tr_total += bsz
+            tr_correct += predicted.eq(labels).sum().item()
+
+        scheduler.step()
+
+        model.eval()
+        all_preds, all_labels = [], []
+        with torch.no_grad():
+            for images, labels in test_loader:
+                images = images.to(device)
+                with autocast():
+                    _, _, _, final_logits = model(images, epoch=EPOCHS)
+                _, predicted = final_logits.max(1)
+                all_preds.append(predicted.cpu().numpy())
+                all_labels.append(labels.numpy())
+        preds_np = np.concatenate(all_preds)
+        labels_np = np.concatenate(all_labels)
+        te_acc = 100.0 * (preds_np == labels_np).sum() / len(labels_np)
+        elapsed = time.time() - t0
+
+        if te_acc > best_acc:
+            best_acc = te_acc
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+
+        if epoch % 10 == 0 or epoch == 1:
+            alpha_val = torch.sigmoid(model.fusion_alpha).item()
+            temp_val = torch.exp(model.log_proto_temp).item()
+            print(f"  [CPGC seed={seed}] Ep {epoch:>3}/{EPOCHS} "
+                  f"CE={tr_ce/tr_total:.3f} SC={tr_sc/tr_total:.3f} "
+                  f"α={alpha_val:.3f} τ={temp_val:.3f} "
+                  f"Test {te_acc:.2f}%  Best {best_acc:.2f}%  ({elapsed:.1f}s)")
+
+        torch.cuda.empty_cache()
+
+    model_path = os.path.join(OUTPUT_DIR, f"CPGC_BS_{tag}_seed{seed}_best.pth")
+    torch.save(best_state, model_path)
+    del model
+    torch.cuda.empty_cache()
+    return {"best_acc": best_acc}
+
+
+def main():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device: {device}")
+    print(f"Seeds: {SEEDS}  Epochs: {EPOCHS}")
+    print(f"λ_SC={LAMBDA_SC}  λ_PROTO={LAMBDA_PROTO}  τ={TEMPERATURE}  τ_proto={PROTO_TEMP}")
+    print(f"Proto EMA={PROTO_EMA}  Proto start epoch={PROTO_START}")
+
+    tf = transforms.Compose([
+        transforms.Resize((IMG_SIZE, IMG_SIZE)),
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomRotation(10),
+        transforms.ToTensor(),
+        transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+    ])
+    test_tf = transforms.Compose([
+        transforms.Resize((IMG_SIZE, IMG_SIZE)),
+        transforms.ToTensor(),
+        transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+    ])
+    train_set = datasets.ImageFolder(os.path.join(DATA_DIR, "train"), transform=tf)
+    test_set = datasets.ImageFolder(os.path.join(DATA_DIR, "test"), transform=test_tf)
+    num_classes = len(train_set.classes)
+    print(f"Classes: {train_set.classes}")
+
+    class_counts = [0] * num_classes
+    for _, label in train_set.samples:
+        class_counts[label] += 1
+
+    test_loader = DataLoader(test_set, batch_size=BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True)
+
+    # Balanced Softmax 类别先验（训练集自然分布）
+    global CLASS_PRIOR
+    total = sum(class_counts)
+    CLASS_PRIOR = torch.tensor([c / total for c in class_counts], dtype=torch.float32)
+    print(f"Class prior: {CLASS_PRIOR.tolist()}")
+
+    all_rows = []
+    for cfg in CONFIGS:
+        tag = cfg["tag"]
+        use_sampler = cfg["use_sampler"]
+        print(f"\n{'='*60}\n配置: CPGC + Balanced Softmax, use_sampler={use_sampler}\n{'='*60}")
+        if use_sampler:
+            sample_weights = [1.0 / class_counts[label] for _, label in train_set.samples]
+            sampler = WeightedRandomSampler(weights=sample_weights, num_samples=len(sample_weights), replacement=True)
+            train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, sampler=sampler, num_workers=2, pin_memory=True)
+        else:
+            train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True, num_workers=2, pin_memory=True)
+
+        results = {}
+        for seed in SEEDS:
+            print(f"\n--- seed={seed} ---")
+            t_start = time.time()
+            res = train_one(seed, train_loader, test_loader, num_classes, device, tag)
+            results[seed] = res
+            print(f"<<< CPGC BS {tag} seed={seed} done. Best acc {res['best_acc']:.2f}%  ({(time.time()-t_start)/60:.1f} min)")
+
+        accs = [results[s]["best_acc"] for s in SEEDS]
+        mean = float(np.mean(accs))
+        std = float(np.std(accs, ddof=1))
+        all_rows.append([tag, round(mean, 2), round(std, 2)] + [round(results[s]["best_acc"], 2) for s in SEEDS])
+        print(f"  {tag}: mean={mean:.2f}%  std={std:.2f}%")
+
+    csv_path = os.path.join(OUTPUT_DIR, "CPGC_BS_3种子结果.csv")
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["config", "mean", "std", "seed42", "seed123", "seed456"])
+        for row in all_rows:
+            w.writerow(row)
+    print(f"\n已保存: {csv_path}")
+
+
+if __name__ == "__main__":
+    main()

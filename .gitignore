@@ -1,0 +1,21 @@
+# ---- 数据与权重（体积大，不入库）----
+data/
+*.pth
+*.pt
+*.ckpt
+outputs/
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# ---- 系统与编辑器 ----
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
