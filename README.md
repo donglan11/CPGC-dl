@@ -65,8 +65,8 @@ GC10-DET 数据集（10 类钢材表面缺陷，训练 1840 / 测试 466 张，�
 ## 安装
 
 ```bash
-git clone https://github.com/<你的用户名>/CPGC.git
-cd CPGC
+git clone https://github.com/donglan11/CPGC-dl.git
+cd CPGC-dl
 pip install -r requirements.txt
 ```
 
