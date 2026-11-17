@@ -31,6 +31,10 @@
                                     s_final = α·s_mlp + (1−α)·s_proto
 ```
 
+![CPGC 方法总览](docs/images/architecture.png)
+
+*Fig. 1 — CPGC 总览：(a) DINO 预训练 ResNet-50 特征提取；(b) 双路表示学习（投影头 + MLP 分类头）；(c) 可学习 α 原型融合决策。*
+
 三个关键设计：
 
 1. **有监督对比学习（SupCon）** 把投影嵌入空间塑造成"类内聚拢、类间分离"，为原型提供稳定的判别性锚点
@@ -61,6 +65,12 @@ GC10-DET 数据集（10 类钢材表面缺陷，训练 1840 / 测试 466 张，�
 **几乎零推理开销**：参数量 23.5M → 27.3M（净增 3.72M），平均推理延迟 25.37 ms → 25.32 ms。
 
 完整数据见 [`results/`](results/)。
+
+### 可视化
+
+Grad-CAM 对比：ResNet-50 基线 vs CPGC，三个代表性缺陷类（折痕 / 轧坑 / 油斑）。CPGC 的热力图更聚焦缺陷本体，基线则分散到背景纹理。
+
+![Grad-CAM 对比](docs/images/gradcam_demo.jpg)
 
 ## 安装
 
